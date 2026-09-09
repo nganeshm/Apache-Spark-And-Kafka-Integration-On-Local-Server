@@ -1,0 +1,45 @@
+# ================================================================================
+# Application configuration for the CSV -> Spark -> Kafka tutorial
+# ================================================================================
+server:
+  port: 8080
+
+spring:
+  application:
+    name: csv-spark-kafka-tutorial
+
+  # Allow reasonably large CSV uploads via the REST endpoint
+  servlet:
+    multipart:
+      max-file-size: 50MB
+      max-request-size: 50MB
+
+  kafka:
+    # Address of your local Kafka broker. Update this if yours runs elsewhere.
+    bootstrap-servers: localhost:9092
+
+    producer:
+      # We serialize keys/values ourselves as plain Strings (see CsvRecordProducer),
+      # so simple StringSerializers are all we need here.
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      # Fail fast when the broker is down instead of blocking the HTTP request for 60s.
+      properties:
+        max.block.ms: 5000
+        request.timeout.ms: 5000
+
+    consumer:
+      group-id: csv-import-consumer-group
+      auto-offset-reset: earliest # read from the beginning of the topic if no offset is committed yet
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+
+# Custom properties consumed by SparkConfig.java
+spark:
+  app-name: csv-spark-kafka-tutorial
+  master: local[*]   # run Spark in-process using all available CPU cores; no cluster needed
+
+logging:
+  level:
+    com.tutorial.csvsparkkafka: INFO
+    org.apache.spark: WARN   # Spark's own logging is very chatty at INFO/DEBUG

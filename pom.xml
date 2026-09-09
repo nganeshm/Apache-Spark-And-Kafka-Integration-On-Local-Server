@@ -1,0 +1,200 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    ================================================================================
+    TUTORIAL PROJECT: CSV Import with Spring Boot + Apache Spark 4.2.0 + Kafka
+    ================================================================================
+    What this pom.xml sets up:
+      1. Spring Boot (web layer + dependency injection + config)
+      2. Apache Spark 4.2.0 (spark-core + spark-sql) to parse/transform the CSV
+      3. Spring Kafka (producer + consumer) to stream parsed rows through Kafka
+
+    IMPORTANT PRACTICAL NOTE (read this before you fight the build):
+      Spark ships its OWN versions of Jackson, Guava, Netty, LZ4, and Scala.
+      Spring Boot also ships Jackson 2.17 and (via its parent BOM) pins Netty 4.1.
+      Spark 4.2.0 needs Jackson 2.21 (including jackson-module-scala / DefaultScalaModule)
+      and Netty 4.2 (EpollIoHandler). We override jackson-bom.version and netty.version
+      to Spark's versions so the whole tree stays aligned. This app uses Tomcat
+      (not Reactor Netty), so the Netty upgrade is safe here.
+
+      Kafka clients still pull the old org.lz4:lz4-java (1.8). Spark 4.2 moved to
+      at.yawk.lz4:lz4-java (1.11), which added LZ4BlockInputStream.newBuilder().
+      Both JARs contain net.jpountz.lz4.*, so the older Kafka copy wins at runtime
+      and Spark blows up while reading a CSV. We exclude org.lz4:lz4-java from
+      spring-kafka and keep Spark's at.yawk fork.
+
+      Spark 4.x also requires Java 17+ and, because it still uses reflection into
+      java.base/java.lang etc, needs some JVM-add-opens flags at runtime even on
+      modern JDKs. Those flags are documented in README.md.
+    ================================================================================
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <!-- Spring Boot parent gives us dependency + plugin version management for free -->
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.3.0</version>
+        <relativePath/>
+    </parent>
+
+    <groupId>com.tutorial</groupId>
+    <artifactId>csv-spark-kafka</artifactId>
+    <version>1.0.0</version>
+    <name>csv-spark-kafka-tutorial</name>
+    <description>Tutorial: CSV import pipeline using Spring Boot, Apache Spark 4.2.0 and Kafka</description>
+
+    <properties>
+        <!-- Spark 4.2.0 requires Java 17+. We target 17 for broad compatibility. -->
+        <java.version>17</java.version>
+
+        <!-- Spark 4.x is built against Scala 2.13, so all spark-* artifacts use the _2.13 suffix -->
+        <scala.binary.version>2.13</scala.binary.version>
+        <spark.version>4.2.0</spark.version>
+
+        <!-- Must match Spark 4.2.0's Netty. Spring Boot 3.3 would otherwise pin 4.1.x
+             and SparkSession creation fails looking for io.netty.channel.epoll.EpollIoHandler. -->
+        <netty.version>4.2.13.Final</netty.version>
+
+        <!-- Spark 4.2.0 is compiled against Jackson 2.21. Spring Boot 3.3 would pin 2.17,
+             which is missing jackson-module-scala on our classpath after Spark exclusions. -->
+        <jackson-bom.version>2.21.2</jackson-bom.version>
+
+        <!-- Spark 4.2 reaches into JDK internals (date/time uses sun.util.calendar.ZoneInfo).
+             Without these, CSV schema inference throws IllegalAccessException on JDK 17+. -->
+        <spark.jvm.args>--add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.lang.invoke=ALL-UNNAMED --add-opens=java.base/java.lang.reflect=ALL-UNNAMED --add-opens=java.base/java.io=ALL-UNNAMED --add-opens=java.base/java.net=ALL-UNNAMED --add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/java.util=ALL-UNNAMED --add-opens=java.base/java.util.concurrent=ALL-UNNAMED --add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED --add-opens=java.base/jdk.internal.ref=ALL-UNNAMED --add-opens=java.base/sun.nio.ch=ALL-UNNAMED --add-opens=java.base/sun.nio.cs=ALL-UNNAMED --add-opens=java.base/sun.security.action=ALL-UNNAMED --add-opens=java.base/sun.util.calendar=ALL-UNNAMED -Dio.netty.tryReflectionSetAccessible=true</spark.jvm.args>
+    </properties>
+
+    <dependencies>
+
+        <!-- ============================================================
+             SPRING WEB — gives us REST controllers (file upload endpoint)
+             ============================================================ -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+
+        <!-- ============================================================
+             SPRING KAFKA — KafkaTemplate (producer) + @KafkaListener (consumer)
+             ============================================================ -->
+        <dependency>
+            <groupId>org.springframework.kafka</groupId>
+            <artifactId>spring-kafka</artifactId>
+            <exclusions>
+                <!-- Old org.lz4 artifact shadows Spark's at.yawk.lz4 fork (same packages). -->
+                <exclusion>
+                    <groupId>org.lz4</groupId>
+                    <artifactId>lz4-java</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+
+        <!-- ============================================================
+             APACHE SPARK — spark-core: RDD/engine internals
+             ============================================================ -->
+        <dependency>
+            <groupId>org.apache.spark</groupId>
+            <artifactId>spark-core_${scala.binary.version}</artifactId>
+            <version>${spark.version}</version>
+            <exclusions>
+                <!-- Spark bundles an old servlet API that can clash with Spring's embedded Tomcat -->
+                <exclusion>
+                    <groupId>javax.servlet</groupId>
+                    <artifactId>*</artifactId>
+                </exclusion>
+                <!-- Avoid Spark's log4j SLF4J binding fighting with Spring Boot's logback -->
+                <exclusion>
+                    <groupId>org.slf4j</groupId>
+                    <artifactId>slf4j-log4j12</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>org.apache.logging.log4j</groupId>
+                    <artifactId>log4j-slf4j2-impl</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+
+        <!-- ============================================================
+             APACHE SPARK SQL — DataFrame / Dataset API, used to read the CSV
+             ============================================================ -->
+        <dependency>
+            <groupId>org.apache.spark</groupId>
+            <artifactId>spark-sql_${scala.binary.version}</artifactId>
+            <version>${spark.version}</version>
+            <exclusions>
+                <exclusion>
+                    <groupId>org.slf4j</groupId>
+                    <artifactId>slf4j-log4j12</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>org.apache.logging.log4j</groupId>
+                    <artifactId>log4j-slf4j2-impl</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+
+        <!-- Spark 4.2 compression codec; explicit so Kafka cannot reintroduce org.lz4. -->
+        <dependency>
+            <groupId>at.yawk.lz4</groupId>
+            <artifactId>lz4-java</artifactId>
+            <version>1.11.0</version>
+        </dependency>
+
+        <!-- Spark's BlockManager registers DefaultScalaModule; keep this explicit so a
+             future Jackson exclusion cannot silently drop it again. Version comes from
+             the jackson-bom we aligned to Spark 4.2.0 above. -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.module</groupId>
+            <artifactId>jackson-module-scala_${scala.binary.version}</artifactId>
+        </dependency>
+
+        <!-- Lombok — removes getter/setter/constructor boilerplate from our model class -->
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <!-- Test dependencies -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.kafka</groupId>
+            <artifactId>spring-kafka-test</artifactId>
+            <scope>test</scope>
+            <exclusions>
+                <exclusion>
+                    <groupId>org.lz4</groupId>
+                    <artifactId>lz4-java</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+
+    </dependencies>
+
+    <build>
+        <finalName>csv-spark-kafka-tutorial</finalName>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+                <configuration>
+                    <excludes>
+                        <exclude>
+                            <groupId>org.projectlombok</groupId>
+                            <artifactId>lombok</artifactId>
+                        </exclude>
+                    </excludes>
+                    <jvmArguments>${spark.jvm.args}</jvmArguments>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+
+</project>
